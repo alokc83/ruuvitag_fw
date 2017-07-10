@@ -79,12 +79,14 @@ void timer_lis2dh12_event_handler(void* p_context);
 
 /* VARIABLES **************************************************************************************/
 static LIS2DH12_drdy_event_t g_fp_drdyCb = NULL;        /**< Data Ready Callback */
-static sensor_buffer_t g_sensorData;                    /**< Union to covert raw data to value for each axis */
+static sensor_buffer_t g_sensorData[32];                /**< Union to covert raw data to value for each axis, conserve room for FiFo */
+static int8_t g_dataIndex = 0;                         /**< Index of data being read */
 static LIS2DH12_PowerMode g_powerMode = LIS2DH12_POWER_DOWN; /**< Current power mode */
 static LIS2DH12_Scale g_scale = LIS2DH12_SCALE2G;       /**< Selected scale */
 static uint8_t g_mgpb = 1;                              /**< milli-g per bit */
 static uint8_t g_resolution = 10;                        /**< milli-g nb of bits */
 static bool g_drdy = false;                             /**< Data Ready flag */
+static bool g_fifo = false;                             /**< using FiFo      */
 
 /* EXTERNAL FUNCTIONS *****************************************************************************/
 
@@ -150,19 +152,35 @@ extern LIS2DH12_Ret LIS2DH12_setPowerMode(LIS2DH12_PowerMode powerMode)
         g_mgpb = 4 << g_scale; // 4mg per bits at normal power/2g, adjust by scaling
         g_resolution = 10;
         time_ms = 10U;
+        g_fifo = false;
         break;
     case LIS2DH12_POWER_LOW:
         ctrl1RegVal |= (LIS2DH_ODR_MASK_1HZ); //Power consumption is same for low-power and normal mode at 1 Hz
-        g_mgpb = 4 << g_scale; // 4 bits per mg at normal power/2g, adjust by scaling
+        g_mgpb = 4 << g_scale; // 4 mg per bit at normal power/2g, adjust by scaling
         g_resolution = 10;
         time_ms = 1000U;
-
+        g_fifo = false;
+        break;
+    case LIS2DH12_POWER_LOWBURST:
+        ctrl1RegVal |= (LIS2DH_ODR_MASK_10HZ); // 3 µA
+        g_mgpb = 4 << g_scale; // 4 mg per bit at normal power/2g, adjust by scaling
+        g_resolution = 10;
+        time_ms = 500U;
+        g_fifo = true;
+        break;
+    case LIS2DH12_POWER_BURST:
+        ctrl1RegVal |= (LIS2DH_ODR_MASK_25HZ | LIS2DH_LPEN_MASK); // 6 µA
+        g_mgpb = 16 << g_scale; // 16 mg  per but at low power/2g, adjust by scaling
+        g_resolution = 8;
+        time_ms = 500U;
+        g_fifo = true;
         break;
     case LIS2DH12_POWER_FAST:
         ctrl1RegVal |= (LIS2DH_ODR_MASK_1620HZ | LIS2DH_LPEN_MASK);
         g_mgpb = 16 << g_scale; // 16 mg per bit at low power/2g, adjust by scaling
         g_resolution = 8;
         time_ms = 1;
+        g_fifo = false;
         break;
     case LIS2DH12_POWER_HIGHRES:
         ctrl1RegVal |= LIS2DH_ODR_MASK_HIGH_RES;
@@ -170,6 +188,7 @@ extern LIS2DH12_Ret LIS2DH12_setPowerMode(LIS2DH12_PowerMode powerMode)
         g_mgpb = 1 << g_scale; // 1 mg bits per mg at high power/2g, adjust by scaling
         g_resolution = 12;
         time_ms = 1;
+        g_fifo = false;
         break;
     case LIS2DH12_POWER_DOWN:
         ctrl1RegVal = 0;
@@ -183,8 +202,17 @@ extern LIS2DH12_Ret LIS2DH12_setPowerMode(LIS2DH12_PowerMode powerMode)
     {
         retVal = writeRegister(LIS2DH_CTRL_REG1, ctrl1RegVal);
         retVal |= writeRegister(LIS2DH_CTRL_REG4, ctrl4RegVal);
+        if ( g_fifo ) {
+            retVal |= writeRegister(LIS2DH_FIFO_CTRL_REG, LIS2DH_STREAM_MASK);
+            retVal |= writeRegister(LIS2DH_CTRL_REG5, LIS2DH_FIFO_EN_MASK);
+        }
     }
 
+    if (g_powerMode != LIS2DH12_POWER_DOWN && time_ms > 0) {
+        err_code = app_timer_stop(lis2dh12_timer_id);
+        APP_ERROR_CHECK(err_code);
+    }
+    
     /* save power mode to check in get functions if power is enabled */
     g_powerMode = powerMode;
 
@@ -196,6 +224,8 @@ extern LIS2DH12_Ret LIS2DH12_setPowerMode(LIS2DH12_PowerMode powerMode)
     }
     else
     {
+        uint8_t value[1] = {0};
+        readRegister(LIS2DH_REFERENCE, value, 1);
         err_code = app_timer_stop(lis2dh12_timer_id);
         APP_ERROR_CHECK(err_code);
     }
@@ -215,7 +245,7 @@ extern LIS2DH12_Ret LIS2DH12_getXmG(int32_t* const accX)
     {
         //Scale value, note: values from accelerometer are 16-bit 2's complement left-justified in all cases. "Extra" LSBs will be noise 
         //Add 32768 (1<<(16-1) to get positive, shift, substract (1<<(resolution-1), scale voila!
-        *accX = (((32768+g_sensorData.sensor.x)>>(16-g_resolution))-(1<<(g_resolution-1)))*g_mgpb ;
+        *accX = (((32768+g_sensorData[g_dataIndex].sensor.x)>>(16-g_resolution))-(1<<(g_resolution-1)))*g_mgpb ;
         //*accX = g_sensorData.sensor.x / (16 << (g_scale)) * 1000 / 1024;
     }
 
@@ -234,7 +264,7 @@ extern LIS2DH12_Ret LIS2DH12_getYmG(int32_t* const accY)
     {
         //Scale value, note: values from accelerometer are 16-bit 2's complement left-justified in all cases. "Extra" LSBs will be noise 
         //Add 32768 (1<<(16-1) to get positive, shift, substract (1<<(resolution-1), scale voila!
-        *accY = (((32768+g_sensorData.sensor.y)>>(16-g_resolution))-(1<<(g_resolution-1)))*g_mgpb ;
+        *accY = (((32768+g_sensorData[g_dataIndex].sensor.y)>>(16-g_resolution))-(1<<(g_resolution-1)))*g_mgpb ;
         //*accY = g_sensorData.sensor.y / (16 << (g_scale)) * 1000 / 1024;
     }
 
@@ -253,7 +283,7 @@ extern LIS2DH12_Ret LIS2DH12_getZmG(int32_t* const accZ)
     {
         //Scale value, note: values from accelerometer are 16-bit 2's complement left-justified in all cases. "Extra" LSBs will be noise 
         //Add 32768 (1<<(16-1) to get positive, shift, substract (1<<(resolution-1), scale voila!
-        *accZ = (((32768+g_sensorData.sensor.z)>>(16-g_resolution))-(1<<(g_resolution-1)))*g_mgpb ;
+        *accZ = (((32768+g_sensorData[g_dataIndex].sensor.z)>>(16-g_resolution))-(1<<(g_resolution-1)))*g_mgpb ;
         //*accZ = g_sensorData.sensor.z / (16 << (g_scale)) * 1000 / 1024;
     }
 
@@ -275,7 +305,21 @@ extern LIS2DH12_Ret LIS2DH12_getALLmG(int32_t* const accX, int32_t* const accY, 
         LIS2DH12_getZmG(accZ);
     }
 
+    if(g_dataIndex){
+      g_dataIndex--;  //Decrement dataindex if we have elements in FiFo
+    }
     return retVal;
+}
+/**
+ *  Return number of elements waiting in FiFo. Returns 0 if sample in FiFo is latest, I.E. proper way to read FiFo is:
+ *  uint8_t count = UINT8_T_MAX;
+ *  while (count){
+ *    count = LIS2DH12_getFifoDepth();
+ *    LIS2DH12_getAllmG( ... );
+ *  }
+ */
+int8_t LIS2DH12_getFifoDepth(void){
+  return g_dataIndex;
 }
 
 /* INTERNAL FUNCTIONS *****************************************************************************/
@@ -406,18 +450,37 @@ static LIS2DH12_Ret writeRegister(uint8_t address, uint8_t dataToWrite)
  */
 void timer_lis2dh12_event_handler(void* p_context)
 {
+    uint8_t nb_to_read;
+    LIS2DH12_Ret retVal = LIS2DH12_RET_ERROR;
     NRF_LOG_DEBUG("LIS2DH12 Timer event'\r\n");
     //nrf_gpio_pin_toggle(19);
-
-    if (LIS2DH12_RET_OK == readRegister(LIS2DH_OUT_X_L, g_sensorData.raw, SENSOR_DATA_SIZE))
+    if(!g_fifo)
     {
-        /* if read was successfull set data ready */
-        g_drdy = true;
-
-        /* call data ready event callback if registered */
-        if (NULL != g_fp_drdyCb)
-        {
-            g_fp_drdyCb();
+        nb_to_read  = 0; //Use only newest element if FiFo is not in use
+    } else {
+        if (LIS2DH12_RET_OK == (retVal = readRegister(LIS2DH_FIFO_SRC_REG, &nb_to_read, 1))) {
+            nb_to_read &= LIS2DH_FSS_MASK;
+        } else {
+            nb_to_read = -1;
         }
+            
+    }
+
+    g_dataIndex = nb_to_read;
+    while ((g_dataIndex >= 0) && (LIS2DH12_RET_OK == (retVal = readRegister(LIS2DH_OUT_X_L, g_sensorData[g_dataIndex].raw, SENSOR_DATA_SIZE))))
+    {
+        g_dataIndex--; //Decrement index to accommodate newer value from FiFo
+        //NRF_LOG_DEBUG("%d ", g_dataIndex);    
+    }
+    g_dataIndex = nb_to_read;
+    /* if read was successfull set data ready */
+    if(LIS2DH12_RET_OK == retVal)
+    {
+      g_drdy = true;
+      /* call data ready event callback if registered and we're at last sample*/
+      if (NULL != g_fp_drdyCb)
+      {
+        g_fp_drdyCb();
+      }
     }
 }

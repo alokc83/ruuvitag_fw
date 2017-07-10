@@ -44,7 +44,9 @@ typedef enum
 /** Available Power Modes for the LIS2DH12 */
 typedef enum{
 	LIS2DH12_POWER_NORMAL = 0,	/**< Normal Power Mode, 10-bit resoulution, 100Hz, 20uA */
-	LIS2DH12_POWER_LOW,			/**< Low Power Mode, 10-bit resolution, 1Hz, 2uA */
+	LIS2DH12_POWER_LOW,		/**< Normal Power Mode, 10-bit resolution, 1Hz, 2µA */
+	LIS2DH12_POWER_LOWBURST,	/**< Normal Power Mode, 10-bit resolution, 10Hz, 4µA */
+	LIS2DH12_POWER_BURST,		/**< Low Power Mode, 8-bit resolution, 25Hz, 4µA */
 	LIS2DH12_POWER_FAST,		/**< Low Power Mode, 8-bit resolution, 1620Hz, 100uA */
 	LIS2DH12_POWER_HIGHRES,		/**< High Power Mode, 12-bit resolution, 1344Hz, 185uA  */
 	LIS2DH12_POWER_DOWN			/**< Stop Operation */
@@ -146,6 +148,12 @@ extern LIS2DH12_Ret LIS2DH12_getZmG(int32_t* const accZ);
  */
 extern LIS2DH12_Ret LIS2DH12_getALLmG(int32_t* const accX, int32_t* const accY, int32_t* const accZ);
 
+/**
+ * Return current data index
+ * 
+ * @retval g_dataIndex	
+ */
+extern int8_t LIS2DH12_getFifoDepth(void);
 
 #ifdef __cplusplus
 }

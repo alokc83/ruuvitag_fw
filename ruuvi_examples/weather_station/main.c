@@ -82,11 +82,25 @@ APP_TIMER_DEF(main_timer_id);                                             /** Cr
 #define URL_BASE_LENGTH 8
 static char url_buffer[17] = {'r', 'u', 'u', '.', 'v', 'i', '/', '#'};
 static uint8_t data_buffer[18] = { 0 };
+
+/** Available High resmode */
+typedef enum{
+	HIGHRES_SLOW = 0,
+        HIGHRES_BURST,
+        HIGHRES_FASTBURST
+} HIGHRES_Mode;
 bool model_plus = false; //Flag for sensors available
 bool highres    = false; //Flag for used mode
+HIGHRES_Mode highresmode = HIGHRES_SLOW;
 bool debounce   = true;
 
 static ruuvi_sensor_t data;
+static uint16_t vbat = 0;
+static int32_t raw_t  = 0;
+static uint32_t raw_p = 0;
+static uint32_t raw_h = 0;
+static int32_t accelerometer[3] = {0};
+
 
 
 /**@brief Function for handling bsp events.
@@ -106,6 +120,7 @@ void bsp_evt_handler(bsp_event_t evt)
 */
 }
 
+
 /**@brief Function for doing power management.
  */
 static void power_manage(void)
@@ -119,14 +134,31 @@ static void power_manage(void)
     }
     else //Change mode on button press
     {
-      if(debounce){
-        highres = !highres;
+      if(debounce) {
+        if ( highres  && highresmode == HIGHRES_FASTBURST) {
+            highres = !highres;
+            highresmode = HIGHRES_SLOW;
+        } else if ( ! highres ) {
+            highres = !highres;
+        } else {
+            highresmode += 1;
+        }
         debounce = false;
         if(model_plus)
         {
           if(highres)
           {
-            LIS2DH12_setPowerMode(LIS2DH12_POWER_LOW);
+            switch ( highresmode ) {
+                case HIGHRES_SLOW:
+                    LIS2DH12_setPowerMode(LIS2DH12_POWER_LOW);
+                    break;
+                case HIGHRES_BURST:
+                    LIS2DH12_setPowerMode(LIS2DH12_POWER_LOWBURST);
+                    break;
+                case HIGHRES_FASTBURST:
+                    LIS2DH12_setPowerMode(LIS2DH12_POWER_BURST);
+                    break;
+            }
           }
           else
           {
@@ -147,6 +179,7 @@ static void power_manage(void)
     }
 }
 
+
 static void updateAdvertisement(void)
 {
   if(highres){
@@ -160,15 +193,52 @@ static void updateAdvertisement(void)
 }
 
 
+/**@brief Function for updating accelrometer data.
+ * depends on how the LIS2DH12 is setup. Advertise date
+ * should now be up-to-date
+ */
+void update_accelerometer(void) 
+{
+    //Should only happen in hires mode... but...
+    uint8_t count = 1;
+    int32_t accx, accy, accz, delta;
+    int32_t saccx, saccy, saccz;
+    int32_t maxdelta = 0;
+    bool wasset = false;
+    if (highres) 
+    {
+      // Get accelerometer data
+      while (count) 
+      {
+        count = LIS2DH12_getFifoDepth();
+        LIS2DH12_getALLmG(&accx, &accy, &accz); 
+        // Since we can have more than one samplekeep only the one
+        // that shows the largest fluctuation
+        delta = abs(1000-sqrt(accx*accx + accy*accy + accz*accz));
+        if (delta >= maxdelta) 
+        {
+            saccx = accx;
+            saccy = accy;
+            saccz = accz;
+            wasset = true;
+        }
+      }
+      
+      if (wasset) 
+      {
+        accelerometer[0] = saccx;
+        accelerometer[1] = saccy;
+        accelerometer[2] = saccz;
+        parseSensorData(&data, raw_t, raw_p, raw_h, vbat, accelerometer);
+        encodeToSensorDataFormat(data_buffer, &data);
+        updateAdvertisement();
+      }
+    }
+}
+
 // Timeout handler for the repeated timer
 void main_timer_handler(void * p_context)
 {
-
-    static int32_t raw_t  = 0;
-    static uint32_t raw_p = 0;
-    static uint32_t raw_h = 0;
-    int32_t accx, accy, accz;
-    static int32_t acc[3] = {0};
 
     //If we have all the sensors
     if(model_plus)
@@ -184,11 +254,6 @@ void main_timer_handler(void * p_context)
    
       //NRF_LOG_INFO("temperature: %d, pressure: %d, humidity: %d\r\n", raw_t, raw_p, raw_h);
     
-      // Get accelerometer data
-      LIS2DH12_getALLmG(&accx, &accy, &accz);    
-      acc[0] = accx;
-      acc[1] = accy;
-      acc[2] = accz;
     }
     
     // If only temperature sensor is present
@@ -201,12 +266,12 @@ void main_timer_handler(void * p_context)
     }
 
     //Get battery voltage
-    static uint16_t vbat = 0;
     vbat = getBattery();
     //NRF_LOG_INFO("temperature: , pressure: , humidity: ");
     //Embed data into structure for parsing
-    parseSensorData(&data, raw_t, raw_p, raw_h, vbat, acc);
-    NRF_LOG_DEBUG("temperature: %d, pressure: %d, humidity: %d x: %d y: %d z: %d\r\n", raw_t, raw_p, raw_h, acc[0], acc[1], acc[2]);
+    parseSensorData(&data, raw_t, raw_p, raw_h, vbat, accelerometer);
+    NRF_LOG_DEBUG("temperature: %d, pressure: %d, humidity: %d x: %d y: %d z: %d\r\n", raw_t, raw_p, raw_h, accelerometer[0], 
+                  accelerometer[1], accelerometer[2]);
     NRF_LOG_INFO("VBAT: %d send %d \r\n", vbat, data.vbat);
     if(highres)
     {
@@ -257,7 +322,7 @@ int main(void)
     if(!init_sensors()){
       model_plus = true;
       //init accelerometer if present
-      LIS2DH12_init(LIS2DH12_POWER_DOWN, LIS2DH12_SCALE2G, NULL);
+      LIS2DH12_init(LIS2DH12_POWER_DOWN, LIS2DH12_SCALE2G, update_accelerometer);
       
       //setup BME280 if present
       bme280_set_oversampling_hum(BME280_OVERSAMPLING_1);
